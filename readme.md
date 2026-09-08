@@ -53,3 +53,6 @@ we have to keep track of every step here in memory plus have shared memory acros
 
 we then render the framebuffer and send it to client
 
+# ai use
+i was trying to go of by the docs but at one point i for frustrated and started vibe coding. i mean still only for help not entire project. i did write a chunk of this by hand
+
