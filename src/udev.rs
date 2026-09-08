@@ -11,6 +11,7 @@ pub fn scan(seat: &str) -> io::Result<(UdevBackend, Vec<PathBuf>)> {
     Ok((backend, nodes))
 }
 
+#[allow(dead_code)]
 pub fn added_path(event: &UdevEvent) -> Option<PathBuf> {
     match event {
         UdevEvent::Added { path, .. } => Some(path.clone()),

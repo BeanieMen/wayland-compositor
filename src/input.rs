@@ -1,5 +1,3 @@
-//! Input helpers: explicit XKB keymap, killswitch detect, shortcuts, LED forwarding.
-
 use std::process::{Command, Stdio};
 
 use smithay::{
@@ -7,7 +5,6 @@ use smithay::{
     reexports::input::{Device, Led},
 };
 
-/// Explicit XKB keymap config — no environment dependence.
 pub fn xkb_config() -> XkbConfig<'static> {
     XkbConfig {
         rules: "evdev",
@@ -18,17 +15,14 @@ pub fn xkb_config() -> XkbConfig<'static> {
     }
 }
 
-/// True when `mods` + `sym` is the failsafe combo Ctrl+Alt+Backspace.
 pub fn is_killswitch(mods: &ModifiersState, sym: Keysym) -> bool {
     mods.ctrl && mods.alt && sym == Keysym::from(keysyms::KEY_BackSpace)
 }
 
-/// True when `mods` + `sym` is Super+Enter (launch terminal).
 pub fn is_terminal_shortcut(mods: &ModifiersState, sym: Keysym) -> bool {
     mods.logo && (sym == Keysym::from(keysyms::KEY_Return) || sym == Keysym::from(keysyms::KEY_KP_Enter))
 }
 
-/// True when `mods` + `sym` is Super+Q or Super+W (close focused window).
 pub fn is_close_shortcut(mods: &ModifiersState, sym: Keysym) -> bool {
     mods.logo && (
         sym == Keysym::from(keysyms::KEY_q)
@@ -38,7 +32,6 @@ pub fn is_close_shortcut(mods: &ModifiersState, sym: Keysym) -> bool {
     )
 }
 
-/// Launch default terminal application with detached Stdio.
 pub fn spawn_terminal() {
     eprintln!("[EXEC] Super+Enter pressed! Attempting to launch terminal emulator...");
     let result = Command::new("alacritty")
@@ -88,12 +81,10 @@ pub fn spawn_terminal() {
     }
 }
 
-/// Convert smithay LED state to a libinput LED mask.
 pub fn leds_for_state(state: LedState) -> Led {
     Led::from(state)
 }
 
-/// Push `leds` to `device` (caps-lock LED etc.).
 pub fn forward_leds(device: &mut Device, leds: LedState) {
     device.led_update(leds_for_state(leds));
 }

@@ -13,6 +13,7 @@ smithay = { version = "0.7", features = [
     "renderer_gl",
     "wayland_frontend",
 ] }
+drm-fourcc = "2"
 wayland-server = "0.31.14"
 wayland-protocols = "0.32"
 calloop = "0.14"
