@@ -2,7 +2,7 @@ mod drm;
 mod input;
 mod udev;
 
-use std::{os::unix::io::OwnedFd, sync::Arc};
+use std::{os::unix::io::OwnedFd, sync::Arc, time::Duration};
 
 use smithay::{
     backend::{
@@ -16,14 +16,20 @@ use smithay::{
     input::{Seat, SeatHandler, SeatState},
     output::Output,
     reexports::{
-        calloop::EventLoop,
+        calloop::{
+            timer::{TimeoutAction, Timer},
+            EventLoop,
+        },
         input::Libinput,
         wayland_server::{protocol::wl_seat, Display},
     },
     utils::Serial,
     wayland::{
         buffer::BufferHandler,
-        compositor::{CompositorClientState, CompositorHandler, CompositorState},
+        compositor::{
+            with_surface_tree_downward, CompositorClientState, CompositorHandler, CompositorState,
+            SurfaceAttributes, TraversalAction,
+        },
         output::{OutputHandler, OutputManagerState},
         selection::{
             data_device::{
@@ -33,12 +39,16 @@ use smithay::{
         },
         shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
         shm::{ShmHandler, ShmState},
+        socket::ListeningSocketSource,
     },
 };
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use wayland_server::{
     backend::{ClientData, ClientId, DisconnectReason},
-    protocol::{wl_buffer, wl_surface::WlSurface},
+    protocol::{
+        wl_buffer,
+        wl_surface::{self, WlSurface},
+    },
     Client,
 };
 
@@ -125,12 +135,23 @@ struct App {
     seat: Seat<Self>,
 }
 
-#[allow(dead_code)]
+fn tile_offset(index: usize, count: usize, win_w: i32, win_h: i32) -> (i32, i32) {
+    if count == 0 {
+        return (0, 0);
+    }
+    let cols = (count as f64).sqrt().ceil() as i32;
+    let rows = count.div_ceil(cols as usize) as i32;
+    let tile_w = win_w / cols.max(1);
+    let tile_h = win_h / rows.max(1);
+    ((index as i32 % cols) * tile_w, (index as i32 / cols) * tile_h)
+}
+
 struct State {
     app: App,
     display: Display<App>,
     output: Output,
     drm: DrmDevice,
+    start: std::time::Instant,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -168,11 +189,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .udev_assign_seat(&seat_name)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "udev_assign_seat failed"))?;
 
-    let state = State {
+    let mut state = State {
         app,
         display,
         output,
         drm,
+        start: std::time::Instant::now(),
     };
 
     let handle = event_loop.handle();
@@ -194,8 +216,58 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     handle.insert_source(drm_notifier, |_, _, _: &mut State| {})?;
 
-    let _ = state;
+    let socket_source = ListeningSocketSource::new_auto()?;
+    eprintln!(
+        "listening on {}",
+        socket_source.socket_name().to_string_lossy()
+    );
+    handle.insert_source(socket_source, |stream, _, state: &mut State| {
+        let mut handle = state.display.handle();
+        let _ = handle.insert_client(stream, Arc::new(ClientState::default()));
+    })?;
+
+    handle.insert_source(
+        Timer::from_duration(Duration::from_millis(16)),
+        |_, _, state: &mut State| {
+            let _ = state.display.dispatch_clients(&mut state.app);
+            let time = state.start.elapsed().as_millis() as u32;
+            let (w, h) = state
+                .output
+                .current_mode()
+                .map(|mode| (mode.size.w, mode.size.h))
+                .unwrap_or((800, 600));
+            let surfaces = state.app.xdg_shell_state.toplevel_surfaces();
+            let count = surfaces.len();
+            for (i, surface) in surfaces.iter().enumerate() {
+                let _tile = tile_offset(i, count, w, h);
+                send_frames_surface_tree(surface.wl_surface(), time);
+            }
+            let _ = state.display.flush_clients();
+            TimeoutAction::ToDuration(Duration::from_millis(16))
+        },
+    )?;
+
     Ok(())
+}
+
+pub fn send_frames_surface_tree(surface: &wl_surface::WlSurface, time: u32) {
+    with_surface_tree_downward(
+        surface,
+        (),
+        |_, _, &()| TraversalAction::DoChildren(()),
+        |_surf, states, &()| {
+            for callback in states
+                .cached_state
+                .get::<SurfaceAttributes>()
+                .current()
+                .frame_callbacks
+                .drain(..)
+            {
+                callback.done(time);
+            }
+        },
+        |_, _, &()| true,
+    );
 }
 
 #[derive(Default)]
