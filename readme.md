@@ -24,6 +24,12 @@ if youre here to use this as a reference or anything
 
 please leave.
 
+and also if youre trying to run this using the release or using cargo run
+
+1) go to a new tty using ctrl + alt + f2 or f3 or wtv tty
+2) do cargo run or run the executable
+
+
 # technical rant
 we are first setting up a `Display` with the capabilities of this compositor to then accept clients
 
