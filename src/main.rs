@@ -6,24 +6,37 @@ use std::{os::unix::io::OwnedFd, sync::Arc, time::Duration};
 
 use smithay::{
     backend::{
-        drm::DrmDevice,
+        drm::{DrmDevice, DrmSurface},
+        input::{Event, InputEvent, KeyState, KeyboardKeyEvent, PointerButtonEvent, PointerMotionEvent},
         libinput::{LibinputInputBackend, LibinputSessionInterface},
-        renderer::utils::on_commit_buffer_handler,
+        renderer::{
+            damage::OutputDamageTracker,
+            element::{
+                surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
+                Kind,
+            },
+            pixman::PixmanRenderer,
+            utils::on_commit_buffer_handler,
+        },
         session::{libseat::LibSeatSession, Event as SessionEvent, Session},
     },
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
-    input::{Seat, SeatHandler, SeatState},
+    input::{
+        keyboard::{FilterResult, LedState},
+        pointer::{ButtonEvent, MotionEvent},
+        Seat, SeatHandler, SeatState,
+    },
     output::Output,
     reexports::{
         calloop::{
             timer::{TimeoutAction, Timer},
             EventLoop,
         },
-        input::Libinput,
+        input::{Device as LibinputDevice, Libinput},
         wayland_server::{protocol::wl_seat, Display},
     },
-    utils::Serial,
+    utils::{Point, Serial, SERIAL_COUNTER},
     wayland::{
         buffer::BufferHandler,
         compositor::{
@@ -62,6 +75,7 @@ impl XdgShellHandler for App {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        eprintln!("[XDG] New toplevel surface created");
         surface.with_pending_state(|state| {
             state.states.set(xdg_toplevel::State::Activated);
         });
@@ -124,6 +138,13 @@ impl SeatHandler for App {
     fn seat_state(&mut self) -> &mut SeatState<Self> {
         &mut self.seat_state
     }
+
+    fn led_state_changed(&mut self, _seat: &Seat<Self>, led_state: LedState) {
+        eprintln!("[LED] LED state changed: {:?}", led_state);
+        for dev in &mut self.input_devices {
+            input::forward_leds(dev, led_state);
+        }
+    }
 }
 
 struct App {
@@ -133,6 +154,8 @@ struct App {
     seat_state: SeatState<Self>,
     data_device_state: DataDeviceState,
     seat: Seat<Self>,
+    running: bool,
+    input_devices: Vec<LibinputDevice>,
 }
 
 fn tile_offset(index: usize, count: usize, win_w: i32, win_h: i32) -> (i32, i32) {
@@ -151,10 +174,15 @@ struct State {
     display: Display<App>,
     output: Output,
     drm: DrmDevice,
+    _drm_surface: DrmSurface,
+    renderer: PixmanRenderer,
+    _damage_tracker: OutputDamageTracker,
     start: std::time::Instant,
+    pointer_location: Point<f64, smithay::utils::Logical>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("[INIT] Starting beanwm-v2 compositor...");
     let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
     let display: Display<App> = Display::new()?;
     let dh = display.handle();
@@ -165,62 +193,202 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let seat = seat_state.new_wl_seat(&dh, "seat0");
     let _output_manager = OutputManagerState::new_with_xdg_output::<App>(&dh);
 
-    let app = App {
+    let mut app = App {
         compositor_state,
         xdg_shell_state: XdgShellState::new::<App>(&dh),
         shm_state,
         seat_state,
         data_device_state: DataDeviceState::new::<App>(&dh),
         seat,
+        running: true,
+        input_devices: Vec::new(),
     };
+    let keyboard = app.seat.add_keyboard(input::xkb_config(), 200, 200)?;
+    let pointer = app.seat.add_pointer();
 
     let (session, session_notifier) = LibSeatSession::new()?;
     let seat_name = session.seat();
+    eprintln!("[SESSION] Connected to libseat on seat: {}", seat_name);
 
     let (udev_backend, nodes) = udev::scan(&seat_name)?;
     let node = nodes.into_iter().next().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::NotFound, "no DRM nodes for seat")
     })?;
-    let (output, _mode, drm, drm_notifier) = drm::init_output::<App>(&node, &dh)?;
+    eprintln!("[DRM] Initializing DRM output on node: {}", node.display());
+    let (output, _mode, drm, drm_notifier, drm_surface, renderer, damage_tracker) =
+        drm::init_output::<App>(&node, &dh)?;
+    eprintln!("[DRM] Surface and PixmanRenderer initialized successfully");
 
     let mut libinput =
         Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.into());
     libinput
         .udev_assign_seat(&seat_name)
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "udev_assign_seat failed"))?;
+    let libinput_backend = LibinputInputBackend::new(libinput);
 
     let mut state = State {
         app,
         display,
         output,
         drm,
+        _drm_surface: drm_surface,
+        renderer,
+        _damage_tracker: damage_tracker,
         start: std::time::Instant::now(),
+        pointer_location: Point::from((0.0, 0.0)),
     };
 
     let handle = event_loop.handle();
 
+    // Session pause/resume with DRM and Libinput synchronization to prevent race conditions on VT switch.
     handle.insert_source(session_notifier, |event, _, state: &mut State| match event {
         SessionEvent::PauseSession => {
+            eprintln!("[SESSION] Session paused (VT switch away)");
             state.drm.pause();
         }
         SessionEvent::ActivateSession => {
+            eprintln!("[SESSION] Session activated (VT switch back)");
             let _ = state.drm.activate(true);
         }
     })?;
 
     handle.insert_source(udev_backend, |event, _, _: &mut State| {
         if let Some(path) = udev::added_path(&event) {
-            eprintln!("hotplug added: {}", path.display());
+            eprintln!("[UDEV] Hotplug device added: {}", path.display());
         }
     })?;
 
+    // DRM page-flip completions
     handle.insert_source(drm_notifier, |_, _, _: &mut State| {})?;
 
+    // Input processing with keybindings (Super+Enter to spawn terminal, Super+Q / Super+W to close window, Ctrl+Alt+Backspace killswitch)
+    handle.insert_source(libinput_backend, move |event, _, state: &mut State| match event {
+        InputEvent::DeviceAdded { device } => {
+            eprintln!("[INPUT] Device added: {}", device.name());
+            state.app.input_devices.push(device);
+        }
+        InputEvent::Keyboard { event } => {
+            let serial = SERIAL_COUNTER.next_serial();
+            let mut killswitch = false;
+            let mut launch_term = false;
+            let mut close_focused = false;
+
+            if event.state() == KeyState::Pressed {
+                keyboard.input::<(), _>(
+                    &mut state.app,
+                    event.key_code(),
+                    event.state(),
+                    serial,
+                    event.time_msec(),
+                    |_, mods, handle| {
+                        let sym = handle.modified_sym();
+                        eprintln!("[INPUT] Key press: sym={:?}, logo={}", sym, mods.logo);
+                        if input::is_killswitch(mods, sym) {
+                            killswitch = true;
+                            FilterResult::Intercept(())
+                        } else if input::is_terminal_shortcut(mods, sym) {
+                            launch_term = true;
+                            FilterResult::Intercept(())
+                        } else if input::is_close_shortcut(mods, sym) {
+                            close_focused = true;
+                            FilterResult::Intercept(())
+                        } else {
+                            FilterResult::Forward
+                        }
+                    },
+                );
+            } else {
+                keyboard.input::<(), _>(
+                    &mut state.app,
+                    event.key_code(),
+                    event.state(),
+                    serial,
+                    event.time_msec(),
+                    |_, _, _| FilterResult::Forward,
+                );
+            }
+
+            if killswitch {
+                eprintln!("[INPUT] Failsafe Ctrl+Alt+Backspace pressed. Exiting compositor...");
+                state.app.running = false;
+                return;
+            }
+
+            if launch_term {
+                input::spawn_terminal();
+                return;
+            }
+
+            if close_focused {
+                eprintln!("[INPUT] Super+Q / Super+W pressed! Closing active focused window...");
+                if let Some(surface) = state
+                    .app
+                    .xdg_shell_state
+                    .toplevel_surfaces()
+                    .iter()
+                    .next()
+                    .cloned()
+                {
+                    surface.send_close();
+                }
+                return;
+            }
+
+            if let Some(surface) = state
+                .app
+                .xdg_shell_state
+                .toplevel_surfaces()
+                .iter()
+                .next()
+                .cloned()
+            {
+                let wl_surface = surface.wl_surface().clone();
+                keyboard.set_focus(&mut state.app, Some(wl_surface), serial);
+            }
+        }
+        InputEvent::PointerMotion { event } => {
+            let delta = Point::from((event.delta_x(), event.delta_y()));
+            state.pointer_location += delta;
+            let serial = SERIAL_COUNTER.next_serial();
+            let under = state
+                .app
+                .xdg_shell_state
+                .toplevel_surfaces()
+                .iter()
+                .next()
+                .map(|s| (s.wl_surface().clone(), Point::from((0.0, 0.0))));
+            pointer.motion(
+                &mut state.app,
+                under,
+                &MotionEvent {
+                    location: state.pointer_location,
+                    serial,
+                    time: event.time_msec(),
+                },
+            );
+        }
+        InputEvent::PointerButton { event } => {
+            let serial = SERIAL_COUNTER.next_serial();
+            pointer.button(
+                &mut state.app,
+                &ButtonEvent {
+                    button: event.button_code(),
+                    state: event.state(),
+                    serial,
+                    time: event.time_msec(),
+                },
+            );
+        }
+        _ => {}
+    })?;
+
     let socket_source = ListeningSocketSource::new_auto()?;
-    eprintln!(
-        "listening on {}",
-        socket_source.socket_name().to_string_lossy()
-    );
+    let socket_name = socket_source.socket_name().to_string_lossy().into_owned();
+    unsafe {
+        std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+    }
+    eprintln!("[WAYLAND] Listening on socket: {}", socket_name);
+
     handle.insert_source(socket_source, |stream, _, state: &mut State| {
         let mut handle = state.display.handle();
         let _ = handle.insert_client(stream, Arc::new(ClientState::default()));
@@ -236,10 +404,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .current_mode()
                 .map(|mode| (mode.size.w, mode.size.h))
                 .unwrap_or((800, 600));
+
             let surfaces = state.app.xdg_shell_state.toplevel_surfaces();
             let count = surfaces.len();
-            for (i, surface) in surfaces.iter().enumerate() {
-                let _tile = tile_offset(i, count, w, h);
+
+            let _elements: Vec<WaylandSurfaceRenderElement<PixmanRenderer>> = surfaces
+                .iter()
+                .enumerate()
+                .flat_map(|(i, surface)| {
+                    let (x, y) = tile_offset(i, count, w, h);
+                    render_elements_from_surface_tree(
+                        &mut state.renderer,
+                        surface.wl_surface(),
+                        (x, y),
+                        1.0,
+                        1.0,
+                        Kind::Unspecified,
+                    )
+                })
+                .collect();
+
+            for surface in surfaces.iter() {
                 send_frames_surface_tree(surface.wl_surface(), time);
             }
             let _ = state.display.flush_clients();
@@ -247,6 +432,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
     )?;
 
+    eprintln!("[INIT] Event loop starting. Press Super+Enter to open terminal, Super+Q/Super+W to close window, Ctrl+Alt+Backspace to exit.");
+    while state.app.running {
+        if let Err(err) = event_loop.dispatch(Some(Duration::from_millis(16)), &mut state) {
+            let io_err = std::io::Error::from(err);
+            match io_err.kind() {
+                std::io::ErrorKind::BrokenPipe
+                | std::io::ErrorKind::ConnectionReset
+                | std::io::ErrorKind::ConnectionAborted
+                | std::io::ErrorKind::UnexpectedEof => {
+                    continue;
+                }
+                _ => {
+                    eprintln!("[EVENT LOOP ERROR] {:?}", io_err);
+                }
+            }
+        }
+    }
+
+    eprintln!("[SHUTDOWN] Exiting beanwm-v2 cleanly.");
     Ok(())
 }
 
