@@ -1,0 +1,18 @@
+[package]
+name = "smithay-compositor"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay = { version = "0.7", features = [
+    "backend_udev",
+    "backend_drm",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "renderer_gl",
+    "wayland_frontend",
+] }
+wayland-server = "0.31.14"
+wayland-protocols = "0.32"
+calloop = "0.14"
