@@ -5,12 +5,21 @@ mod udev;
 use std::{os::unix::io::OwnedFd, sync::Arc};
 
 use smithay::{
-    backend::renderer::utils::on_commit_buffer_handler,
+    backend::{
+        drm::DrmDevice,
+        libinput::{LibinputInputBackend, LibinputSessionInterface},
+        renderer::utils::on_commit_buffer_handler,
+        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
+    },
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
     input::{Seat, SeatHandler, SeatState},
     output::Output,
-    reexports::wayland_server::{protocol::wl_seat, Display},
+    reexports::{
+        calloop::EventLoop,
+        input::Libinput,
+        wayland_server::{protocol::wl_seat, Display},
+    },
     utils::Serial,
     wayland::{
         buffer::BufferHandler,
@@ -116,6 +125,79 @@ struct App {
     seat: Seat<Self>,
 }
 
+#[allow(dead_code)]
+struct State {
+    app: App,
+    display: Display<App>,
+    output: Output,
+    drm: DrmDevice,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut event_loop: EventLoop<State> = EventLoop::try_new()?;
+    let display: Display<App> = Display::new()?;
+    let dh = display.handle();
+
+    let compositor_state = CompositorState::new::<App>(&dh);
+    let shm_state = ShmState::new::<App>(&dh, vec![]);
+    let mut seat_state = SeatState::new();
+    let seat = seat_state.new_wl_seat(&dh, "seat0");
+    let _output_manager = OutputManagerState::new_with_xdg_output::<App>(&dh);
+
+    let app = App {
+        compositor_state,
+        xdg_shell_state: XdgShellState::new::<App>(&dh),
+        shm_state,
+        seat_state,
+        data_device_state: DataDeviceState::new::<App>(&dh),
+        seat,
+    };
+
+    let (session, session_notifier) = LibSeatSession::new()?;
+    let seat_name = session.seat();
+
+    let (udev_backend, nodes) = udev::scan(&seat_name)?;
+    let node = nodes.into_iter().next().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no DRM nodes for seat")
+    })?;
+    let (output, _mode, drm, drm_notifier) = drm::init_output::<App>(&node, &dh)?;
+
+    let mut libinput =
+        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.into());
+    libinput
+        .udev_assign_seat(&seat_name)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "udev_assign_seat failed"))?;
+
+    let state = State {
+        app,
+        display,
+        output,
+        drm,
+    };
+
+    let handle = event_loop.handle();
+
+    handle.insert_source(session_notifier, |event, _, state: &mut State| match event {
+        SessionEvent::PauseSession => {
+            state.drm.pause();
+        }
+        SessionEvent::ActivateSession => {
+            let _ = state.drm.activate(true);
+        }
+    })?;
+
+    handle.insert_source(udev_backend, |event, _, _: &mut State| {
+        if let Some(path) = udev::added_path(&event) {
+            eprintln!("hotplug added: {}", path.display());
+        }
+    })?;
+
+    handle.insert_source(drm_notifier, |_, _, _: &mut State| {})?;
+
+    let _ = state;
+    Ok(())
+}
+
 #[derive(Default)]
 struct ClientState {
     compositor_state: CompositorClientState,
@@ -131,22 +213,3 @@ delegate_shm!(App);
 delegate_output!(App);
 delegate_seat!(App);
 delegate_data_device!(App);
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let display: Display<App> = Display::new()?;
-    let dh = display.handle();
-    let compositor_state = CompositorState::new::<App>(&dh);
-    let shm_state = ShmState::new::<App>(&dh, vec![]);
-    let mut seat_state = SeatState::new();
-    let seat = seat_state.new_wl_seat(&dh, "seat0");
-    let _output_manager = OutputManagerState::new_with_xdg_output::<App>(&dh);
-    let _app = App {
-        compositor_state,
-        xdg_shell_state: XdgShellState::new::<App>(&dh),
-        shm_state,
-        seat_state,
-        data_device_state: DataDeviceState::new::<App>(&dh),
-        seat,
-    };
-    Ok(())
-}
