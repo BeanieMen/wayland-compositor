@@ -7,63 +7,63 @@ use std::{os::unix::io::OwnedFd, sync::Arc, time::Duration};
 use smithay::{
     backend::{
         drm::DrmDevice,
-        input::{AbsolutePositionEvent, Event, InputEvent, KeyState, KeyboardKeyEvent, PointerButtonEvent, PointerMotionEvent},
+        input::{
+            AbsolutePositionEvent, Event, InputEvent, KeyState, KeyboardKeyEvent,
+            PointerButtonEvent, PointerMotionEvent,
+        },
         libinput::{LibinputInputBackend, LibinputSessionInterface},
         renderer::{
+            Color32F, ImportAll,
             element::{
+                Id, Kind, render_elements,
                 solid::SolidColorRenderElement,
-                surface::{render_elements_from_surface_tree, WaylandSurfaceRenderElement},
-                render_elements, Id, Kind,
+                surface::{WaylandSurfaceRenderElement, render_elements_from_surface_tree},
             },
             gles::GlesRenderer,
             utils::on_commit_buffer_handler,
-            Color32F, ImportAll,
         },
-        session::{libseat::LibSeatSession, Event as SessionEvent, Session},
+        session::{Event as SessionEvent, Session, libseat::LibSeatSession},
     },
     delegate_compositor, delegate_data_device, delegate_output, delegate_seat, delegate_shm,
     delegate_xdg_shell,
     desktop::{Space, Window},
     input::{
+        Seat, SeatHandler, SeatState,
         keyboard::{FilterResult, LedState},
         pointer::{ButtonEvent, MotionEvent},
-        Seat, SeatHandler, SeatState,
     },
     output::Output,
     reexports::{
         calloop::{
-            timer::{TimeoutAction, Timer},
             EventLoop,
+            timer::{TimeoutAction, Timer},
         },
-        input::{Device as LibinputDevice, Libinput},
-        wayland_server::{protocol::wl_seat, Display},
+        input::{Device as LibinputDevice, DeviceCapability, Libinput},
+        wayland_server::{Display, protocol::wl_seat},
     },
-    utils::{Physical, Point, Rectangle, Scale, Serial, SERIAL_COUNTER},
+    utils::{IsAlive, Logical, Physical, Point, Rectangle, SERIAL_COUNTER, Scale, Serial, Size},
     wayland::{
         buffer::BufferHandler,
-        compositor::{
-            CompositorClientState, CompositorHandler, CompositorState,
-        },
+        compositor::{CompositorClientState, CompositorHandler, CompositorState},
         output::{OutputHandler, OutputManagerState},
         selection::{
+            SelectionHandler,
             data_device::{
                 ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
             },
-            SelectionHandler,
         },
-        shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState},
+        shell::xdg::{
+            PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
+        },
         shm::{ShmHandler, ShmState},
         socket::ListeningSocketSource,
     },
 };
 use wayland_protocols::xdg::shell::server::xdg_toplevel;
 use wayland_server::{
-    backend::{ClientData, ClientId, DisconnectReason},
-    protocol::{
-        wl_buffer,
-        wl_surface::WlSurface,
-    },
     Client,
+    backend::{ClientData, ClientId, DisconnectReason},
+    protocol::{wl_buffer, wl_surface::WlSurface},
 };
 
 use drm::BeanDrmCompositor;
@@ -73,7 +73,6 @@ render_elements! {
     Surface=WaylandSurfaceRenderElement<R>,
     Solid=SolidColorRenderElement,
 }
-
 
 impl BufferHandler for App {
     fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
@@ -92,7 +91,37 @@ impl XdgShellHandler for App {
         surface.send_configure();
 
         let window = Window::new_wayland_window(surface);
-        self.space.map_element(window, (0, 0), true);
+        self.space.map_element(window.clone(), (0, 0), true);
+        self.tile_order.push(window.clone());
+        if let Some(keyboard) = self.seat.get_keyboard() {
+            focus_window(self, &keyboard, Some(&window), SERIAL_COUNTER.next_serial());
+        }
+        self.layout_dirty = true;
+    }
+
+    fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
+        let surface = surface.wl_surface();
+        if let Some(window) = self
+            .tile_order
+            .iter()
+            .find(|window| {
+                window
+                    .toplevel()
+                    .is_some_and(|top| top.wl_surface() == surface)
+            })
+            .cloned()
+        {
+            self.space.unmap_elem(&window);
+            self.tile_order.retain(|window| {
+                !window
+                    .toplevel()
+                    .is_some_and(|top| top.wl_surface() == surface)
+            });
+        }
+        if self.focused_surface.as_ref() == Some(surface) {
+            self.focused_surface = None;
+        }
+        self.layout_dirty = true;
     }
 
     fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {}
@@ -161,7 +190,6 @@ impl SeatHandler for App {
     }
 }
 
-
 struct App {
     compositor_state: CompositorState,
     xdg_shell_state: XdgShellState,
@@ -172,6 +200,11 @@ struct App {
     running: bool,
     input_devices: Vec<LibinputDevice>,
     space: Space<Window>,
+    /// Stable layout order. `Space` is a stacking/input structure and must not
+    /// decide tile positions, otherwise focusing a window reorders the layout.
+    tile_order: Vec<Window>,
+    focused_surface: Option<WlSurface>,
+    layout_dirty: bool,
 }
 
 struct State {
@@ -183,20 +216,191 @@ struct State {
     compositor: BeanDrmCompositor,
     start: std::time::Instant,
     pointer_location: Point<f64, smithay::utils::Logical>,
+    session_active: bool,
+    session: LibSeatSession,
 }
 
+fn dwindle_rectangles(
+    count: usize,
+    bounds: Rectangle<i32, Logical>,
+) -> Vec<Rectangle<i32, Logical>> {
+    fn split(
+        index: usize,
+        remaining: usize,
+        bounds: Rectangle<i32, Logical>,
+        depth: usize,
+        rectangles: &mut Vec<Rectangle<i32, Logical>>,
+    ) {
+        if remaining == 1 {
+            rectangles[index] = bounds;
+            return;
+        }
 
-fn tile_offset(index: usize, count: usize, win_w: i32, win_h: i32) -> (i32, i32) {
-    if count == 0 {
-        return (0, 0);
+        // First split left/right, then top/bottom, and alternate thereafter.
+        // The first window owns one half; all later windows recursively dwindle
+        // into the other half.
+        // Keep compatibility with the Rust 2024 minimum supported compiler.
+        #[allow(clippy::manual_is_multiple_of)]
+        let split_vertically = depth % 2 == 0;
+        let (first, rest) = if split_vertically {
+            let first_width = bounds.size.w / 2;
+            (
+                Rectangle::new(bounds.loc, Size::from((first_width, bounds.size.h))),
+                Rectangle::new(
+                    (bounds.loc.x + first_width, bounds.loc.y).into(),
+                    Size::from((bounds.size.w - first_width, bounds.size.h)),
+                ),
+            )
+        } else {
+            let first_height = bounds.size.h / 2;
+            (
+                Rectangle::new(bounds.loc, Size::from((bounds.size.w, first_height))),
+                Rectangle::new(
+                    (bounds.loc.x, bounds.loc.y + first_height).into(),
+                    Size::from((bounds.size.w, bounds.size.h - first_height)),
+                ),
+            )
+        };
+        rectangles[index] = first;
+        split(index + 1, remaining - 1, rest, depth + 1, rectangles);
     }
-    let cols = (count as f64).sqrt().ceil() as i32;
-    let rows = count.div_ceil(cols as usize) as i32;
-    let tile_w = win_w / cols.max(1);
-    let tile_h = win_h / rows.max(1);
-    ((index as i32 % cols) * tile_w, (index as i32 / cols) * tile_h)
+
+    let mut rectangles = vec![Rectangle::default(); count];
+    if count != 0 {
+        split(0, count, bounds, 0, &mut rectangles);
+    }
+    rectangles
 }
 
+fn focus_window(
+    app: &mut App,
+    keyboard: &smithay::input::keyboard::KeyboardHandle<App>,
+    window: Option<&Window>,
+    serial: Serial,
+) {
+    let target = window.and_then(|w| w.toplevel().map(|t| t.wl_surface().clone()));
+    if app.focused_surface == target {
+        return;
+    }
+
+    app.focused_surface = target.clone();
+    keyboard.set_focus(app, target.clone(), serial);
+    for element in app.space.elements() {
+        if let Some(toplevel) = element.toplevel() {
+            let active = Some(toplevel.wl_surface()) == target.as_ref();
+            toplevel.with_pending_state(|state| {
+                if active {
+                    state.states.set(xdg_toplevel::State::Activated);
+                } else {
+                    state.states.unset(xdg_toplevel::State::Activated);
+                }
+            });
+            let _ = toplevel.send_pending_configure();
+        }
+    }
+}
+
+impl State {
+    /// Resolve focus against compositor-owned tile bounds, not a client's
+    /// surface/input region. A client may temporarily render smaller than its
+    /// assigned tile while it processes a configure, but the whole tile should
+    /// still select that client.
+    fn tiled_window_under(&self, point: Point<f64, Logical>) -> Option<Window> {
+        let (width, height) = self
+            .output
+            .current_mode()
+            .map(|mode| (mode.size.w, mode.size.h))
+            .unwrap_or((1920, 1080));
+        let bounds = Rectangle::new((0, 0).into(), Size::from((width, height)));
+        self.app
+            .tile_order
+            .iter()
+            .zip(dwindle_rectangles(self.app.tile_order.len(), bounds))
+            .find(|(_, tile)| tile.to_f64().contains(point))
+            .map(|(window, _)| window.clone())
+    }
+
+    fn apply_tiling(&mut self) {
+        self.app.tile_order.retain(|window| window.alive());
+        let count = self.app.tile_order.len();
+        if count == 0 {
+            self.app.layout_dirty = false;
+            return;
+        }
+        let (width, height) = self
+            .output
+            .current_mode()
+            .map(|mode| (mode.size.w, mode.size.h))
+            .unwrap_or((1920, 1080));
+
+        let rectangles = dwindle_rectangles(
+            count,
+            Rectangle::new((0, 0).into(), Size::from((width, height))),
+        );
+        for (window, rect) in self.app.tile_order.clone().into_iter().zip(rectangles) {
+            self.app.space.map_element(window.clone(), rect.loc, false);
+            if let Some(toplevel) = window.toplevel() {
+                toplevel.with_pending_state(|state| {
+                    state.size = Some(rect.size);
+                    state.bounds = Some(Size::from((width, height)));
+                });
+                let _ = toplevel.send_pending_configure();
+            }
+        }
+        self.app.layout_dirty = false;
+    }
+
+    fn move_focused_tile(&mut self, dx: i32, dy: i32) {
+        let Some(focused) = self.app.focused_surface.as_ref() else {
+            return;
+        };
+        let Some(index) = self.app.tile_order.iter().position(|window| {
+            window
+                .toplevel()
+                .is_some_and(|top| top.wl_surface() == focused)
+        }) else {
+            return;
+        };
+        let count = self.app.tile_order.len();
+        let (width, height) = self
+            .output
+            .current_mode()
+            .map(|mode| (mode.size.w, mode.size.h))
+            .unwrap_or((1920, 1080));
+        let rectangles = dwindle_rectangles(
+            count,
+            Rectangle::new((0, 0).into(), Size::from((width, height))),
+        );
+        let center = |rect: Rectangle<i32, Logical>| {
+            (rect.loc.x * 2 + rect.size.w, rect.loc.y * 2 + rect.size.h)
+        };
+        let (x, y) = center(rectangles[index]);
+        let destination = rectangles
+            .iter()
+            .enumerate()
+            .filter(|(candidate, _)| *candidate != index)
+            .filter_map(|(candidate, rect)| {
+                let (other_x, other_y) = center(*rect);
+                let primary = if dx != 0 {
+                    (other_x - x) * dx
+                } else {
+                    (other_y - y) * dy
+                };
+                let secondary = if dx != 0 {
+                    (other_y - y).abs()
+                } else {
+                    (other_x - x).abs()
+                };
+                (primary > 0).then_some((candidate, primary, secondary))
+            })
+            .min_by_key(|(_, primary, secondary)| (*primary, *secondary))
+            .map(|(candidate, _, _)| candidate);
+        if let Some(destination) = destination {
+            self.app.tile_order.swap(index, destination);
+            self.app.layout_dirty = true;
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("[INIT] Starting beanwm-v2 compositor...");
@@ -222,12 +426,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         running: true,
         input_devices: Vec::new(),
         space,
+        tile_order: Vec::new(),
+        focused_surface: None,
+        layout_dirty: false,
     };
 
     let keyboard = app.seat.add_keyboard(input::xkb_config(), 200, 200)?;
+    // One Wayland seat pointer receives motion from every libinput pointer
+    // device added below (mice, touchpads, trackballs, and tablets).
     let pointer = app.seat.add_pointer();
 
-    let (session, session_notifier) = LibSeatSession::new()?;
+    let (mut session, session_notifier) = LibSeatSession::new()?;
     let seat_name = session.seat();
     eprintln!("[SESSION] Connected to libseat on seat: {}", seat_name);
 
@@ -237,18 +446,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })?;
     eprintln!("[DRM] Initializing DRM output on node: {}", node.display());
 
+    let drm_fd = session.open(
+        &node,
+        smithay::reexports::rustix::fs::OFlags::RDWR
+            | smithay::reexports::rustix::fs::OFlags::CLOEXEC,
+    )?;
     let (output, _mode, drm, drm_notifier, renderer, compositor) =
-        drm::init_output::<App>(&node, &dh)?;
+        drm::init_output::<App>(drm_fd, &dh)?;
     eprintln!("[DRM] GBM+GLES compositor initialised successfully");
 
     app.space.map_output(&output, (0, 0));
 
     let mut libinput =
-        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.into());
+        Libinput::new_with_udev::<LibinputSessionInterface<LibSeatSession>>(session.clone().into());
     libinput
         .udev_assign_seat(&seat_name)
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::Other, "udev_assign_seat failed"))?;
+        .map_err(|_| std::io::Error::other("udev_assign_seat failed"))?;
     let libinput_backend = LibinputInputBackend::new(libinput);
+    let initial_pointer_location = output
+        .current_mode()
+        .map(|mode| Point::from((mode.size.w as f64 / 2.0, mode.size.h as f64 / 2.0)))
+        .unwrap_or_else(|| Point::from((960.0, 540.0)));
 
     let mut state = State {
         app,
@@ -258,23 +476,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         renderer,
         compositor,
         start: std::time::Instant::now(),
-        pointer_location: Point::from((0.0, 0.0)),
+        pointer_location: initial_pointer_location,
+        session_active: true,
+        session: session.clone(),
     };
 
     let handle = event_loop.handle();
 
-    handle.insert_source(session_notifier, |event, _, state: &mut State| match event {
-        SessionEvent::PauseSession => {
-            eprintln!("[SESSION] Session paused (VT switch away)");
-            state.drm.pause();
-        }
-        SessionEvent::ActivateSession => {
-            eprintln!("[SESSION] Session activated (VT switch back)");
-            if let Err(e) = state.drm.activate(true) {
-                eprintln!("[SESSION] activate error: {:?}", e);
+    handle.insert_source(
+        session_notifier,
+        |event, _, state: &mut State| match event {
+            SessionEvent::PauseSession => {
+                eprintln!("[SESSION] Session paused (VT switch away)");
+                state.session_active = false;
+                state.drm.pause();
             }
-        }
-    })?;
+            SessionEvent::ActivateSession => {
+                eprintln!("[SESSION] Session activated (VT switch back)");
+                if let Err(e) = state.drm.activate(true) {
+                    eprintln!("[SESSION] activate error: {:?}", e);
+                } else {
+                    state.compositor.reset_buffers();
+                    state.app.layout_dirty = true;
+                    state.session_active = true;
+                }
+            }
+        },
+    )?;
 
     handle.insert_source(drm_notifier, |_, _, state: &mut State| {
         if let Err(e) = state.compositor.frame_submitted() {
@@ -282,250 +510,196 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     })?;
 
-    handle.insert_source(libinput_backend, move |event, _, state: &mut State| match event {
-        InputEvent::DeviceAdded { device } => {
-            eprintln!("[INPUT] Device added: {}", device.name());
-            state.app.input_devices.push(device);
-        }
-        InputEvent::Keyboard { event } => {
-            let serial = SERIAL_COUNTER.next_serial();
-            let mut killswitch = false;
-            let mut launch_term = false;
-            let mut close_focused = false;
+    handle.insert_source(
+        libinput_backend,
+        move |event, _, state: &mut State| match event {
+            InputEvent::DeviceAdded { device } => {
+                eprintln!("[INPUT] Device added: {}", device.name());
+                if device.has_capability(DeviceCapability::Pointer) {
+                    eprintln!("[INPUT] Pointing device ready: {}", device.name());
+                }
+                state.app.input_devices.push(device);
+            }
+            InputEvent::Keyboard { event } => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let mut killswitch = false;
+                let mut launch_term = false;
+                let mut close_focused = false;
+                let mut move_tile = None;
+                let mut switch_tty = None;
 
-            if event.state() == KeyState::Pressed {
-                keyboard.input::<(), _>(
-                    &mut state.app,
-                    event.key_code(),
-                    event.state(),
-                    serial,
-                    event.time_msec(),
-                    |_, mods, handle| {
-                        let sym = handle.modified_sym();
-                        eprintln!("[INPUT] Key press: sym={:?}, logo={}", sym, mods.logo);
-                        if input::is_killswitch(mods, sym) {
-                            killswitch = true;
-                            FilterResult::Intercept(())
-                        } else if input::is_terminal_shortcut(mods, sym) {
-                            launch_term = true;
-                            FilterResult::Intercept(())
-                        } else if input::is_close_shortcut(mods, sym) {
-                            close_focused = true;
-                            FilterResult::Intercept(())
-                        } else {
-                            FilterResult::Forward
-                        }
-                    },
-                );
-            } else {
-                keyboard.input::<(), _>(
-                    &mut state.app,
-                    event.key_code(),
-                    event.state(),
-                    serial,
-                    event.time_msec(),
-                    |_, _, _| FilterResult::Forward,
-                );
-            }
+                if event.state() == KeyState::Pressed {
+                    keyboard.input::<(), _>(
+                        &mut state.app,
+                        event.key_code(),
+                        event.state(),
+                        serial,
+                        event.time_msec(),
+                        |_, mods, handle| {
+                            let sym = handle.modified_sym();
+                            eprintln!("[INPUT] Key press: sym={:?}, logo={}", sym, mods.logo);
+                            if input::is_killswitch(mods, sym) {
+                                killswitch = true;
+                                FilterResult::Intercept(())
+                            } else if input::is_terminal_shortcut(mods, sym) {
+                                launch_term = true;
+                                FilterResult::Intercept(())
+                            } else if input::is_close_shortcut(mods, sym) {
+                                close_focused = true;
+                                FilterResult::Intercept(())
+                            } else if let Some(direction) = input::tile_move_direction(mods, sym) {
+                                move_tile = Some(direction);
+                                FilterResult::Intercept(())
+                            } else if let Some(tty) = input::tty_switch_destination(mods, sym)
+                                .or_else(|| input::tty_switch_fallback_destination(mods, sym))
+                            {
+                                switch_tty = Some(tty);
+                                FilterResult::Intercept(())
+                            } else {
+                                FilterResult::Forward
+                            }
+                        },
+                    );
+                } else {
+                    keyboard.input::<(), _>(
+                        &mut state.app,
+                        event.key_code(),
+                        event.state(),
+                        serial,
+                        event.time_msec(),
+                        |_, _, _| FilterResult::Forward,
+                    );
+                }
 
-            if killswitch {
-                eprintln!("[INPUT] Failsafe Ctrl+Alt+Backspace pressed. Exiting...");
-                state.app.running = false;
-                return;
-            }
-            if launch_term {
-                input::spawn_terminal();
-                return;
-            }
-            if close_focused {
-                eprintln!("[INPUT] Super+Q/Super+W – closing focused window");
-                if let Some(window) = state.app.space.elements().next().cloned() {
-                    if let Some(toplevel) = window.toplevel() {
+                if killswitch {
+                    eprintln!("[INPUT] Failsafe Ctrl+Alt+Backspace pressed. Exiting...");
+                    state.app.running = false;
+                    return;
+                }
+                if launch_term {
+                    input::spawn_terminal();
+                    return;
+                }
+                if close_focused {
+                    eprintln!("[INPUT] Super+Q/Super+W – closing focused window");
+                    if let Some(surface) = state.app.focused_surface.as_ref()
+                        && let Some(window) = state.app.tile_order.iter().find(|window| {
+                            window
+                                .toplevel()
+                                .is_some_and(|top| top.wl_surface() == surface)
+                        })
+                        && let Some(toplevel) = window.toplevel()
+                    {
                         toplevel.send_close();
                     }
+                    return;
                 }
-                return;
+                if let Some((dx, dy)) = move_tile {
+                    state.move_focused_tile(dx, dy);
+                }
+                if let Some(tty) = switch_tty {
+                    eprintln!("[SESSION] Requesting switch to VT {}", tty);
+                    if let Err(error) = state.session.change_vt(tty) {
+                        eprintln!("[SESSION] Could not switch to VT {}: {:?}", tty, error);
+                    }
+                }
             }
+            InputEvent::PointerMotion { event } => {
+                let delta = Point::from((event.delta_x(), event.delta_y()));
+                state.pointer_location += delta;
 
-            let focus_surface: Option<WlSurface> = state
-                .app
-                .space
-                .element_under(state.pointer_location)
-                .and_then(|(w, _)| w.toplevel().map(|t| t.wl_surface().clone()))
-                .or_else(|| {
-                    state
-                        .app
-                        .space
-                        .elements()
-                        .next()
-                        .and_then(|w| w.toplevel().map(|t| t.wl_surface().clone()))
+                let (w, h) = state
+                    .output
+                    .current_mode()
+                    .map(|m| (m.size.w as f64, m.size.h as f64))
+                    .unwrap_or((1920.0, 1080.0));
+                state.pointer_location.x = state.pointer_location.x.clamp(0.0, w);
+                state.pointer_location.y = state.pointer_location.y.clamp(0.0, h);
+
+                let serial = SERIAL_COUNTER.next_serial();
+                let under_window = state
+                    .app
+                    .space
+                    .element_under(state.pointer_location)
+                    .map(|(w, p)| (w.clone(), p));
+
+                let under = under_window.as_ref().and_then(|(w, pos)| {
+                    w.toplevel().map(|t| {
+                        let pos_f64: Point<f64, smithay::utils::Logical> =
+                            Point::from((pos.x as f64, pos.y as f64));
+                        (t.wl_surface().clone(), pos_f64)
+                    })
                 });
-            if let Some(wl_surface) = focus_surface {
-                keyboard.set_focus(&mut state.app, Some(wl_surface), serial);
+                let focus_target = state.tiled_window_under(state.pointer_location);
+
+                focus_window(&mut state.app, &keyboard, focus_target.as_ref(), serial);
+
+                pointer.motion(
+                    &mut state.app,
+                    under,
+                    &MotionEvent {
+                        location: state.pointer_location,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
             }
-        }
-        InputEvent::PointerMotion { event } => {
-            let delta = Point::from((event.delta_x(), event.delta_y()));
-            state.pointer_location += delta;
+            InputEvent::PointerMotionAbsolute { event } => {
+                let (w, h) = state
+                    .output
+                    .current_mode()
+                    .map(|m| (m.size.w as f64, m.size.h as f64))
+                    .unwrap_or((1920.0, 1080.0));
+                state.pointer_location =
+                    Point::from((event.x_transformed(w as i32), event.y_transformed(h as i32)));
 
-            let (w, h) = state
-                .output
-                .current_mode()
-                .map(|m| (m.size.w as f64, m.size.h as f64))
-                .unwrap_or((1920.0, 1080.0));
-            state.pointer_location.x = state.pointer_location.x.clamp(0.0, w);
-            state.pointer_location.y = state.pointer_location.y.clamp(0.0, h);
+                let serial = SERIAL_COUNTER.next_serial();
+                let under_window = state
+                    .app
+                    .space
+                    .element_under(state.pointer_location)
+                    .map(|(w, p)| (w.clone(), p));
 
-            let serial = SERIAL_COUNTER.next_serial();
-            let under_window = state
-                .app
-                .space
-                .element_under(state.pointer_location)
-                .map(|(w, p)| (w.clone(), p));
+                let under = under_window.as_ref().and_then(|(w, pos)| {
+                    w.toplevel().map(|t| {
+                        let pos_f64: Point<f64, smithay::utils::Logical> =
+                            Point::from((pos.x as f64, pos.y as f64));
+                        (t.wl_surface().clone(), pos_f64)
+                    })
+                });
+                let focus_target = state.tiled_window_under(state.pointer_location);
 
-            let under = under_window.as_ref().and_then(|(w, pos)| {
-                w.toplevel().map(|t| {
-                    let pos_f64: Point<f64, smithay::utils::Logical> =
-                        Point::from((pos.x as f64, pos.y as f64));
-                    (t.wl_surface().clone(), pos_f64)
-                })
-            });
+                focus_window(&mut state.app, &keyboard, focus_target.as_ref(), serial);
 
-            // Focus follows pointer: set keyboard focus and update Activated xdg state
-            if let Some((ref window, _)) = under_window {
-                state.app.space.raise_element(window, true);
-                let target_surface = window.toplevel().map(|t| t.wl_surface().clone());
-                if let Some(ref surface) = target_surface {
-                    keyboard.set_focus(&mut state.app, Some(surface.clone()), serial);
-                }
-                for element in state.app.space.elements() {
-                    if let Some(toplevel) = element.toplevel() {
-                        let active = Some(toplevel.wl_surface()) == target_surface.as_ref();
-                        toplevel.with_pending_state(|s| {
-                            if active {
-                                s.states.set(xdg_toplevel::State::Activated);
-                            } else {
-                                s.states.unset(xdg_toplevel::State::Activated);
-                            }
-                        });
-                        toplevel.send_configure();
-                    }
-                }
-            } else {
-                keyboard.set_focus(&mut state.app, Option::<WlSurface>::None, serial);
+                pointer.motion(
+                    &mut state.app,
+                    under,
+                    &MotionEvent {
+                        location: state.pointer_location,
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
             }
+            InputEvent::PointerButton { event } => {
+                let serial = SERIAL_COUNTER.next_serial();
+                let focus_target = state.tiled_window_under(state.pointer_location);
 
-            pointer.motion(
-                &mut state.app,
-                under,
-                &MotionEvent {
-                    location: state.pointer_location,
-                    serial,
-                    time: event.time_msec(),
-                },
-            );
-        }
-        InputEvent::PointerMotionAbsolute { event } => {
-            let (w, h) = state
-                .output
-                .current_mode()
-                .map(|m| (m.size.w as f64, m.size.h as f64))
-                .unwrap_or((1920.0, 1080.0));
-            state.pointer_location = Point::from((
-                event.x_transformed(w as i32),
-                event.y_transformed(h as i32),
-            ));
+                focus_window(&mut state.app, &keyboard, focus_target.as_ref(), serial);
 
-            let serial = SERIAL_COUNTER.next_serial();
-            let under_window = state
-                .app
-                .space
-                .element_under(state.pointer_location)
-                .map(|(w, p)| (w.clone(), p));
-
-            let under = under_window.as_ref().and_then(|(w, pos)| {
-                w.toplevel().map(|t| {
-                    let pos_f64: Point<f64, smithay::utils::Logical> =
-                        Point::from((pos.x as f64, pos.y as f64));
-                    (t.wl_surface().clone(), pos_f64)
-                })
-            });
-
-            // Focus follows pointer: set keyboard focus and update Activated xdg state
-            if let Some((ref window, _)) = under_window {
-                state.app.space.raise_element(window, true);
-                let target_surface = window.toplevel().map(|t| t.wl_surface().clone());
-                if let Some(ref surface) = target_surface {
-                    keyboard.set_focus(&mut state.app, Some(surface.clone()), serial);
-                }
-                for element in state.app.space.elements() {
-                    if let Some(toplevel) = element.toplevel() {
-                        let active = Some(toplevel.wl_surface()) == target_surface.as_ref();
-                        toplevel.with_pending_state(|s| {
-                            if active {
-                                s.states.set(xdg_toplevel::State::Activated);
-                            } else {
-                                s.states.unset(xdg_toplevel::State::Activated);
-                            }
-                        });
-                        toplevel.send_configure();
-                    }
-                }
-            } else {
-                keyboard.set_focus(&mut state.app, Option::<WlSurface>::None, serial);
+                pointer.button(
+                    &mut state.app,
+                    &ButtonEvent {
+                        button: event.button_code(),
+                        state: event.state(),
+                        serial,
+                        time: event.time_msec(),
+                    },
+                );
             }
-
-            pointer.motion(
-                &mut state.app,
-                under,
-                &MotionEvent {
-                    location: state.pointer_location,
-                    serial,
-                    time: event.time_msec(),
-                },
-            );
-        }
-        InputEvent::PointerButton { event } => {
-            let serial = SERIAL_COUNTER.next_serial();
-            let under_window = state
-                .app
-                .space
-                .element_under(state.pointer_location)
-                .map(|(w, p)| (w.clone(), p));
-
-            if let Some((ref window, _)) = under_window {
-                state.app.space.raise_element(window, true);
-                let target_surface = window.toplevel().map(|t| t.wl_surface().clone());
-                if let Some(ref surface) = target_surface {
-                    keyboard.set_focus(&mut state.app, Some(surface.clone()), serial);
-                }
-                for element in state.app.space.elements() {
-                    if let Some(toplevel) = element.toplevel() {
-                        let active = Some(toplevel.wl_surface()) == target_surface.as_ref();
-                        toplevel.with_pending_state(|s| {
-                            if active {
-                                s.states.set(xdg_toplevel::State::Activated);
-                            } else {
-                                s.states.unset(xdg_toplevel::State::Activated);
-                            }
-                        });
-                        toplevel.send_configure();
-                    }
-                }
-            }
-
-            pointer.button(
-                &mut state.app,
-                &ButtonEvent {
-                    button: event.button_code(),
-                    state: event.state(),
-                    serial,
-                    time: event.time_msec(),
-                },
-            );
-        }
-        _ => {}
-    })?;
+            _ => {}
+        },
+    )?;
 
     // Wayland socket
     let socket_source = ListeningSocketSource::new_auto()?;
@@ -545,70 +719,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         |_, _, state: &mut State| {
             let _ = state.display.dispatch_clients(&mut state.app);
 
+            if !state.session_active {
+                return TimeoutAction::ToDuration(Duration::from_millis(16));
+            }
+
             let elapsed = state.start.elapsed();
 
-            let (w, h) = state
-                .output
-                .current_mode()
-                .map(|m| (m.size.w, m.size.h))
-                .unwrap_or((1920, 1080));
+            if state.app.layout_dirty {
+                state.apply_tiling();
+            }
 
-            let count = state.app.space.elements().count();
-            let windows: Vec<Window> = state.app.space.elements().cloned().collect();
-            for (i, window) in windows.iter().enumerate() {
-                let (x, y) = tile_offset(i, count, w, h);
-                state.app.space.map_element(window.clone(), (x, y), false);
+            let windows = state.app.tile_order.clone();
+            for window in &windows {
                 // Notify clients it's safe to render the next frame
-                window.send_frame(
-                    &state.output,
-                    elapsed,
-                    Some(Duration::ZERO),
-                    |_, _| None,
-                );
+                window.send_frame(&state.output, elapsed, Some(Duration::ZERO), |_, _| None);
             }
 
             let scale = Scale::from(1.0_f64);
-            let mut elements: Vec<CustomRenderElement<GlesRenderer>> = windows
-                .iter()
-                .flat_map(|window| {
-                    let loc_logical = state
-                        .app
-                        .space
-                        .element_location(window)
-                        .unwrap_or_default();
-                    let loc_phys: Point<i32, Physical> =
-                        loc_logical.to_physical_precise_round(scale);
-                    if let Some(toplevel) = window.toplevel() {
-                        let surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
-                            render_elements_from_surface_tree(
-                                &mut state.renderer,
-                                toplevel.wl_surface(),
-                                loc_phys,
-                                scale,
-                                1.0,
-                                Kind::Unspecified,
-                            );
-                        surface_elements
-                            .into_iter()
-                            .map(CustomRenderElement::Surface)
-                            .collect()
-                    } else {
-                        vec![]
-                    }
-                })
-                .collect();
-
             let pointer_phys: Point<i32, Physical> =
                 state.pointer_location.to_physical_precise_round(scale);
-            let cursor_rect = Rectangle::new(pointer_phys, (12, 12).into());
+            // `DrmCompositor` expects elements front-to-back. Put the cursor
+            // first so opaque client surfaces cannot occlude it.
+            let cursor_rect = Rectangle::new(pointer_phys, (28, 28).into());
             let cursor_element = SolidColorRenderElement::new(
                 Id::new(),
                 cursor_rect,
                 0usize,
-                Color32F::new(1.0, 1.0, 1.0, 1.0),
-                Kind::Unspecified,
+                Color32F::new(0.2, 1.0, 0.2, 1.0),
+                Kind::Cursor,
             );
-            elements.push(CustomRenderElement::Solid(cursor_element));
+            let mut elements = vec![CustomRenderElement::Solid(cursor_element)];
+            elements.extend(windows.iter().flat_map(|window| {
+                let loc_logical = state.app.space.element_location(window).unwrap_or_default();
+                let loc_phys: Point<i32, Physical> = loc_logical.to_physical_precise_round(scale);
+                if let Some(toplevel) = window.toplevel() {
+                    let surface_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> =
+                        render_elements_from_surface_tree(
+                            &mut state.renderer,
+                            toplevel.wl_surface(),
+                            loc_phys,
+                            scale,
+                            1.0,
+                            Kind::Unspecified,
+                        );
+                    surface_elements
+                        .into_iter()
+                        .map(CustomRenderElement::Surface)
+                        .collect()
+                } else {
+                    vec![]
+                }
+            }));
 
             const CLEAR: [f32; 4] = [0.05, 0.05, 0.1, 1.0];
             match state
@@ -620,10 +781,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     smithay::backend::drm::compositor::FrameFlags::DEFAULT,
                 ) {
                 Ok(result) => {
-                    if !result.is_empty {
-                        if let Err(e) = state.compositor.queue_frame(()) {
-                            eprintln!("[RENDER] queue_frame error: {:?}", e);
-                        }
+                    if !result.is_empty
+                        && let Err(e) = state.compositor.queue_frame(())
+                    {
+                        eprintln!("[RENDER] queue_frame error: {:?}", e);
                     }
                 }
                 Err(e) => {

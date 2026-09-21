@@ -1,46 +1,54 @@
-use std::{collections::HashSet, fs::OpenOptions, os::unix::io::OwnedFd, path::Path};
+use std::{collections::HashSet, os::unix::io::OwnedFd};
 
 use drm_fourcc::DrmFourcc;
 use smithay::{
     backend::{
         allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice},
         drm::{
-            compositor::DrmCompositor,
+            DrmDevice, DrmDeviceFd, DrmDeviceNotifier, compositor::DrmCompositor,
             exporter::gbm::GbmFramebufferExporter,
-            DrmDevice, DrmDeviceFd, DrmDeviceNotifier,
         },
-        egl::{context::ContextPriority, EGLContext, EGLDisplay},
+        egl::{EGLContext, EGLDisplay, context::ContextPriority},
         renderer::gles::GlesRenderer,
     },
     output::{Mode, Output, PhysicalProperties, Subpixel},
     reexports::{
-        drm::control::{connector, crtc, Device as ControlDevice, Mode as DrmMode},
-        wayland_server::{protocol::wl_output::WlOutput, DisplayHandle, GlobalDispatch},
+        drm::control::{Device as ControlDevice, Mode as DrmMode, connector, crtc},
+        wayland_server::{DisplayHandle, GlobalDispatch, protocol::wl_output::WlOutput},
     },
     utils::{DevPath, DeviceFd, Size},
     wayland::output::WlOutputData,
 };
 
-pub type BeanDrmCompositor = DrmCompositor<
-    GbmAllocator<DrmDeviceFd>,
-    GbmFramebufferExporter<DrmDeviceFd>,
-    (),
-    DrmDeviceFd,
->;
+pub type BeanDrmCompositor =
+    DrmCompositor<GbmAllocator<DrmDeviceFd>, GbmFramebufferExporter<DrmDeviceFd>, (), DrmDeviceFd>;
+pub type OutputInit = (
+    Output,
+    Mode,
+    DrmDevice,
+    DrmDeviceNotifier,
+    GlesRenderer,
+    BeanDrmCompositor,
+);
+type ConnectorMode = (
+    String,
+    PhysicalProperties,
+    Mode,
+    crtc::Handle,
+    connector::Handle,
+    DrmMode,
+);
 
 pub fn init_output<D>(
-    node: &Path,
+    device_fd: OwnedFd,
     dh: &DisplayHandle,
-) -> Result<
-    (Output, Mode, DrmDevice, DrmDeviceNotifier, GlesRenderer, BeanDrmCompositor),
-    Box<dyn std::error::Error>,
->
+) -> Result<OutputInit, Box<dyn std::error::Error>>
 where
     D: GlobalDispatch<WlOutput, WlOutputData> + 'static,
 {
-    // ── 1. Open the DRM node ─────────────────────────────────────────────────
-    let file = OpenOptions::new().read(true).write(true).open(node)?;
-    let drm_fd = DrmDeviceFd::new(DeviceFd::from(OwnedFd::from(file)));
+    // The fd comes from the session manager (libseat), which is what makes
+    // pause/resume notifications on VT switches actually release DRM access.
+    let drm_fd = DrmDeviceFd::new(DeviceFd::from(device_fd));
     let (mut drm_device, notifier) = DrmDevice::new(drm_fd.clone(), true)?;
 
     let (name, physical, mode, crtc_handle, connector_handle, drm_mode) =
@@ -50,11 +58,9 @@ where
 
     let gbm_device: GbmDevice<DrmDeviceFd> = GbmDevice::new(drm_fd.clone())?;
 
-
     let egl_display = unsafe { EGLDisplay::new(gbm_device.clone())? };
     let egl_context = EGLContext::new_with_priority(&egl_display, ContextPriority::High)?;
 
-    
     let renderer_formats: HashSet<_> = egl_context
         .dmabuf_texture_formats()
         .iter()
@@ -89,12 +95,7 @@ where
     Ok((output, mode, drm_device, notifier, renderer, drm_compositor))
 }
 
-fn first_connected_mode(
-    fd: &DrmDeviceFd,
-) -> Result<
-    (String, PhysicalProperties, Mode, crtc::Handle, connector::Handle, DrmMode),
-    Box<dyn std::error::Error>,
-> {
+fn first_connected_mode(fd: &DrmDeviceFd) -> Result<ConnectorMode, Box<dyn std::error::Error>> {
     let res = fd.resource_handles()?;
     let crtc_handle = *res
         .crtcs()

@@ -2,13 +2,21 @@
 
 i am not even gonna try and name this. not my best project or even good it was just a sort of practice for me to "TRY" and learn/make a wayland compositor
 
-# build
-```
-cargo build
-```
+# requirements
+- rust
+- rustup
+- cargo
+- wayland
+
+# build and run
+and also if youre trying to run this using the release or using cargo run
+
+1) go to a new tty using ctrl + alt + f2 or f3 or
+2) do cargo run or run the executable
 
 # what is this?
 this is hell. okay yeah this is supposed to be a fun project so i learn wayland and how my hyprdots work
+there is only a terminal and dwindle tiling note
 
 The goal of this project was not to make a production-ready compositor.
 
@@ -23,11 +31,6 @@ The goal of this project was not to make a production-ready compositor.
 if youre here to use this as a reference or anything
 
 please leave.
-
-and also if youre trying to run this using the release or using cargo run
-
-1) go to a new tty using ctrl + alt + f2 or f3 or wtv tty
-2) do cargo run or run the executable
 
 
 # technical rant
